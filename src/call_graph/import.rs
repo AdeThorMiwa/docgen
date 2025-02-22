@@ -88,7 +88,7 @@ pub struct ExternalImport {
 impl ExternalImport {
     pub fn new(path_segments: &[String]) -> Self {
         Self {
-            identifier: path_segments[0].to_owned(),
+            identifier: path_segments.last().unwrap().to_owned(),
             full_path: path_segments.join("::"),
         }
     }
