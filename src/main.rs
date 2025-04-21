@@ -1,5 +1,7 @@
 use docgen::cli::Cli;
 
-fn main() -> anyhow::Result<()> {
-    Cli::init()
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    dotenv::dotenv().ok();
+    Cli::init().await
 }
