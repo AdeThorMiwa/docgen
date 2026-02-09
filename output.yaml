@@ -4,13 +4,19 @@ info:
   description: A description of the generated API
   version: 1.0.0
 paths:
-  /:
-    get:
-      responses:
-        '200':
-          description: Successful operation
   /authenticate:
     post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              properties:
+                Full:
+                  type: object
+                Partial:
+                  type: object
+              type: object
+        required: true
       responses:
         '200':
           description: Successful operation
@@ -20,89 +26,20 @@ paths:
         '200':
           description: Successful operation
     post:
-      responses:
-        '200':
-          description: Successful operation
-  /channels/{channel_id}:
-    get:
-      parameters:
-      - name: channel_id
-        in: path
-        description: some description
+      requestBody:
+        content:
+          application/json:
+            schema:
+              properties:
+                name:
+                  type: string
+              type: object
         required: true
-        schema:
-          type: string
-      responses:
-        '200':
-          description: Successful operation
-    delete:
-      parameters:
-      - name: channel_id
-        in: path
-        description: some description
-        required: true
-        schema:
-          type: string
-      responses:
-        '200':
-          description: Successful operation
-  /channels/{channel_id}/invite:
-    get:
-      parameters:
-      - name: channel_id
-        in: path
-        description: some description
-        required: true
-        schema:
-          type: string
-      responses:
-        '200':
-          description: Successful operation
-    post:
-      parameters:
-      - name: channel_id
-        in: path
-        description: some description
-        required: true
-        schema:
-          type: string
       responses:
         '200':
           description: Successful operation
   /health:
     get:
-      responses:
-        '200':
-          description: Successful operation
-  /messages:
-    get:
-      responses:
-        '200':
-          description: Successful operation
-    post:
-      responses:
-        '200':
-          description: Successful operation
-  /messages/{message_id}:
-    delete:
-      parameters:
-      - name: message_id
-        in: path
-        description: some description
-        required: true
-        schema:
-          type: string
-      responses:
-        '200':
-          description: Successful operation
-    patch:
-      parameters:
-      - name: message_id
-        in: path
-        description: some description
-        required: true
-        schema:
-          type: string
       responses:
         '200':
           description: Successful operation
