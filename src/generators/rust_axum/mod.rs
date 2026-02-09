@@ -1,6 +1,6 @@
 use super::Generator;
 use crate::{
-    domain::ir::{self, HTTPMethod, Parameter, Route, IR},
+    domain::ir::{self, Body, BodyProperty, BodyType, HTTPMethod, Parameter, PropType, Route, IR},
     llm::{
         openai::{
             deepseek::Deepseek,
@@ -13,6 +13,7 @@ use crate::{
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use derive_builder::Builder;
+use prompts::{BODY_EXTRACT_PROMPT, BODY_OUTER_EXTRACT_PROMPT};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
@@ -23,6 +24,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
 };
+mod prompts;
 
 // const AXUM_ROUTER_CREATION_SIGNATURE: &'static str = "Router::new()";
 
@@ -680,73 +682,37 @@ Example object:
 
         println!("routes in rountelis === {}", basic_routes.len());
 
-        async fn build_route_info(route: BasicRoute) -> anyhow::Result<Route> {
+        struct BodyStructure {}
+
+        // async fn retrieve_body_structure_info(route: &BasicRoute) -> anyhow::Result<Option<Body>> {
+        //             let mut llm = Deepseek::new(&BODY_EXTRACT_PROMPT);
+
+        //             let file_content = read_to_string(route.handler.import_path.clone())
+        //                 .context("failed to read route file")?;
+        //             let query = LLMQueryRequest {
+        //                 history: vec![],
+        //                 query: format!(
+        //                     "
+        // function_name: {}
+        // file_content: {}
+        // ###
+        //                 ",
+        //                     route.handler.identifier, file_content
+        //                 ),
+        //             };
+
+        //             let response = llm.execute_query(query);
+        // }
+
+        async fn build_route_info(route: BasicRoute, base_dir: &Path) -> anyhow::Result<Route> {
             // build params
-            const PROMPT: &'static str = r##"
-You are a Rust axum framework documentation assistant.
-You will be given the contents of a rust file (in between ### <file content> ###), a function name (that could optionally include a struct name prepended to it, e.g Struct::method_name). 
-The function is a axum route handler that we're trying to extract parameter information from so that we can use the information to build a open api parameters array and requestBody object.
-Return a json object containing:
-1. a parameters array, which object in the array containing what type of parameter it is (e.g path, query, e.tc), the name of the parameter, a description of the parameter (based on its usage through the file) and the data_type of the parameter. If you cannot find any parameters, return an empty array
-2. a body object that includes the content_type (e.g application/json, application/octet-stream e.tc), and if content_type is json, form-data or any other structured type, include a structure property which is a map of field names to an object containing their type and if they are required, if it doesnt have a content-type with structure, return null for structure. If you cannot figure out the structure of the body because the struct definition is not in the current file sent to you, include a property module in the body whose value is to the import path of the struct definition. If it doesnt have any body, return null
-
-
-Example 1. 
-Input: 
-function_name: add_item_to_collection
-file_content:
-###
-pub struct RequestPayloadDto {
-    name: String,
-    description: String,
-    amount: Option<u32>
-}
-
-pub async fn add_item_to_collection(
-    State(state): State<AppState>,
-    Path(collection_id): Path<String>,
-    Json(payload): Json<RequestPayloadDto>,
-) -> Result<Json, CollectionError> {
-    // skipping the code here for brevity
-}
-###
-
-Output:
-{
-"parameters": [
-    {
-        "param_type": "path",
-        "name": "collection_id",
-        "data_type": "String",
-        "description": "The id of the collection to add the item"
-    }
-],
-"body": {
-    "content_type": "application/json",
-    "structure": {
-        "name": {
-            "type": "String",
-            "required": true
-        },
-        "description": {
-            "type": "String",
-            "required": true
-        },
-        "amount": {
-            "type": "u32",
-            "required": false
-        }
-    }
-}
-}
-        "##;
 
             // let llm_options = GPT3_5OptionsBuilder::default()
             //     .prompt(PROMPT.to_owned())
             //     .build()
             //     .expect("failed to build gpt options");
             // let mut llm = GPT3_5::new(llm_options);
-            let mut llm = Deepseek::new(&PROMPT);
+            let mut llm = Deepseek::new(&BODY_EXTRACT_PROMPT);
 
             let file_content = read_to_string(route.handler.import_path.clone())
                 .context("failed to read route file")?;
@@ -770,18 +736,19 @@ file_content: {}
                 description: String,
             }
 
-            #[derive(Deserialize, Debug)]
+            #[derive(Deserialize, Debug, Clone)]
             struct IRBodyStructureRef {
                 #[serde(rename = "type")]
                 r#type: String,
                 required: bool,
             }
 
-            #[derive(Deserialize, Debug)]
+            #[derive(Deserialize, Debug, Clone)]
             struct IRBody {
                 content_type: String,
                 structure: Option<HashMap<String, IRBodyStructureRef>>,
                 module: Option<String>,
+                identifier: String,
             }
 
             #[derive(Deserialize, Debug)]
@@ -828,16 +795,110 @@ file_content: {}
                 })
                 .collect::<Vec<Parameter>>();
 
+            async fn find_and_extract_type_structure(
+                module: &str,
+                base_dir: &Path,
+                identifier: &str,
+            ) -> anyhow::Result<Option<HashMap<String, IRBodyStructureRef>>> {
+                if let ImportPath::Local(import_path) = resolve_import(
+                    &module,
+                    "sabbatical_server", // TODO:  get from manifest
+                    base_dir,
+                )? {
+                    let mut llm = Deepseek::new(&BODY_OUTER_EXTRACT_PROMPT);
+
+                    let file_content =
+                        read_to_string(import_path.clone()).context("failed to read route file")?;
+                    let query = LLMQueryRequest {
+                        history: vec![],
+                        query: format!(
+                            "
+struct_name: {}
+file_content: {}
+###
+                ",
+                            identifier, file_content
+                        ),
+                    };
+
+                    #[derive(Deserialize)]
+                    struct Extractor {
+                        structure: HashMap<String, IRBodyStructureRef>,
+                    }
+
+                    let response = llm.execute_query(query).await?;
+                    let response = match serde_json::from_str::<Extractor>(&response.text) {
+                        Ok(nodes) => nodes,
+                        Err(e) => bail!(format!(
+                            "llm returned unserializable string {e} \n\n{}",
+                            response.text,
+                        )),
+                    };
+
+                    return Ok(Some(response.structure));
+                }
+
+                Ok(None)
+            }
+
+            let body = if let Some(body) = &response.body {
+                let structure = if let Some(structure) = body.structure.clone() {
+                    Some(structure)
+                } else {
+                    if let Some(module) = &body.module {
+                        find_and_extract_type_structure(&module, base_dir, &body.identifier).await?
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(structure) = structure {
+                    let (properties, required_fields) = {
+                        let mut props = HashMap::new();
+                        let mut required = vec![];
+                        for (prop, struct_ref) in structure {
+                            let value = BodyProperty {
+                                prop_type: match struct_ref.r#type.as_ref() {
+                                    "String" => PropType::String,
+                                    "Number" => PropType::Number,
+                                    "Boolean" => PropType::Boolean,
+                                    _ => PropType::Object,
+                                },
+                            };
+
+                            props.insert(prop.clone(), value);
+                            if struct_ref.required {
+                                required.push(prop);
+                            }
+                        }
+                        (props, required)
+                    };
+
+                    Some(Body {
+                        body_type: BodyType::Json,
+                        properties,
+                        required_fields,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // let body = retrieve_body_structure_info(&route).await?;
+
             Ok(Route {
                 path: route.path,
                 method: route.method,
                 parameters,
+                body,
             })
         }
 
         let mut routes = Vec::new();
         for route in basic_routes {
-            routes.push(build_route_info(route).await?);
+            routes.push(build_route_info(route, &entry_file).await?);
         }
 
         // let mut routes = Vec::new();

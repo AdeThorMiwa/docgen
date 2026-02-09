@@ -1,6 +1,6 @@
 use crate::{
     code::downloader,
-    domain::ir::{self, HTTPMethod},
+    domain::ir::{self, BodyType, HTTPMethod, PropType},
     generators::{
         rust_axum::{RustAxumGenerator, RustAxumGeneratorArgsBuilder},
         Generator,
@@ -11,7 +11,10 @@ use args::{Args, Commands, Framework};
 use clap::Parser;
 use indoc::formatdoc;
 use oas3::{
-    spec::{Info, ObjectOrReference, Operation, Parameter, PathItem, Response},
+    spec::{
+        Info, MediaType, ObjectOrReference, ObjectSchema, Operation, Parameter, PathItem,
+        RequestBody, Response, SchemaType, SchemaTypeSet,
+    },
     OpenApiV3Spec,
 };
 use regex::Regex;
@@ -108,8 +111,66 @@ impl Cli {
                             parameters.push(ObjectOrReference::Object(parameter));
                         }
 
+                        let request_body = if let Some(body) = &route.body {
+                            Some(ObjectOrReference::Object(RequestBody {
+                                content: {
+                                    let mut content = BTreeMap::new();
+
+                                    match body.body_type {
+                                        BodyType::Json => {
+                                            let media_type = MediaType {
+                                                schema: Some(ObjectOrReference::Object(
+                                                    ObjectSchema {
+                                                        schema_type: Some(SchemaTypeSet::Single(
+                                                            oas3::spec::SchemaType::Object,
+                                                        )),
+                                                        properties: {
+                                                            let mut props = BTreeMap::new();
+
+                                                            for (prop, prop_body) in
+                                                                &body.properties
+                                                            {
+                                                                props.insert(
+                                                                    prop.clone(),
+                                                                    ObjectOrReference::Object(
+                                                                        ObjectSchema {
+                                                                            schema_type: Some(SchemaTypeSet::Single(match prop_body.prop_type {
+                                                                                PropType::Number => SchemaType::Number,
+                                                                                PropType::Boolean => SchemaType::Boolean,
+                                                                                PropType::String => SchemaType::String,
+                                                                                PropType::Object => SchemaType::Object,
+                                                                            })),
+                                                                            ..Default::default()
+                                                                        },
+                                                                    ),
+                                                                );
+                                                            }
+
+                                                            props
+                                                        },
+                                                        ..Default::default()
+                                                    },
+                                                )),
+                                                ..Default::default()
+                                            };
+
+                                            content
+                                                .insert("application/json".to_string(), media_type);
+                                        }
+                                    }
+
+                                    content
+                                },
+                                required: Some(true),
+                                ..Default::default()
+                            }))
+                        } else {
+                            None
+                        };
+
                         let op = Operation {
                             parameters,
+                            request_body,
                             responses: Some(response),
                             ..Default::default()
                         };

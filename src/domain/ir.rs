@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::collections::HashMap;
 
 use anyhow::bail;
 
@@ -49,10 +49,36 @@ pub struct Parameter {
 }
 
 #[derive(Debug)]
+pub enum BodyType {
+    Json,
+}
+
+#[derive(Debug)]
+pub enum PropType {
+    String,
+    Number,
+    Boolean,
+    Object,
+}
+
+#[derive(Debug)]
+pub struct BodyProperty {
+    pub prop_type: PropType,
+}
+
+#[derive(Debug)]
+pub struct Body {
+    pub body_type: BodyType,
+    pub required_fields: Vec<String>,
+    pub properties: HashMap<String, BodyProperty>,
+}
+
+#[derive(Debug)]
 pub struct Route {
     pub path: String,
     pub method: HTTPMethod,
     pub parameters: Vec<Parameter>,
+    pub body: Option<Body>,
 }
 
 #[derive(Debug)]
