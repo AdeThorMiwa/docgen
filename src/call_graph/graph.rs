@@ -6,7 +6,7 @@ use crate::utils::to_snake_case;
 use anyhow::Context;
 use petgraph::{
     dot::{Config, Dot},
-    graph::DiGraph,
+    graph::{DiGraph, NodeIndex},
     Graph,
 };
 use proc_macro2::LineColumn;
@@ -16,8 +16,8 @@ use std::{
     path::{Path, PathBuf},
 };
 use syn::{
-    spanned::Spanned, visit::Visit, Expr, ExprCall, ExprMethodCall, File, ImplItem, ImplItemFn,
-    ItemFn, ItemImpl, ItemUse, Type, UseTree,
+    spanned::Spanned, visit::Visit, Expr, ExprCall, ExprMethodCall, ExprPath, File, ImplItem,
+    ImplItemFn, ItemFn, ItemImpl, ItemUse, Local, Type, UseTree,
 };
 
 pub trait Printer {
@@ -26,6 +26,16 @@ pub trait Printer {
         let indent = " ".repeat(self.get_depth() * 2);
         println!("{}{}", indent, message);
     }
+}
+
+pub enum VariableDataType {
+    Native,
+    Custom(String),
+}
+
+pub struct Variable {
+    identifier: String,
+    data_type: VariableDataType,
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +62,30 @@ impl From<&ItemFn> for CallNode {
         Self {
             method_of: None,
             identifier: value.sig.ident.to_string(),
+            start: span.start(),
+            end: span.end(),
+        }
+    }
+}
+
+impl From<&ExprPath> for CallNode {
+    fn from(value: &ExprPath) -> Self {
+        let span = value.span();
+        Self {
+            method_of: None,
+            identifier: value.path.get_ident().unwrap().to_string(),
+            start: span.start(),
+            end: span.end(),
+        }
+    }
+}
+
+impl From<&ExprMethodCall> for CallNode {
+    fn from(value: &ExprMethodCall) -> Self {
+        let span = value.span();
+        Self {
+            method_of: None,
+            identifier: value.method.to_string(),
             start: span.start(),
             end: span.end(),
         }
@@ -88,6 +122,7 @@ pub struct CallGraph {
     imports: ImportMap,
     graph: DiGraph<String, Edge>,
     nodes_map: HashMap<String, CallNode>,
+    nodes_index_map: HashMap<String, NodeIndex>,
     entry_file: PathBuf,
     entrypoint: EntryPoint,
 }
@@ -107,6 +142,7 @@ impl CallGraph {
             imports: ImportMap::new(),
             graph: Graph::new(),
             nodes_map: HashMap::new(),
+            nodes_index_map: HashMap::new(),
             entry_file: entry_file.to_owned(),
             entrypoint,
         })
@@ -116,8 +152,10 @@ impl CallGraph {
         CallGraphBuilder::new(
             &self.entry_file,
             self.entrypoint.clone(),
+            None,
             &mut self.graph,
             &mut self.nodes_map,
+            &mut self.nodes_index_map,
             &mut self.imports,
             &self.manifest,
             0,
@@ -135,8 +173,11 @@ impl CallGraph {
 struct CallGraphBuilder<'builder> {
     graph: &'builder mut DiGraph<String, Edge>,
     nodes_map: &'builder mut HashMap<String, CallNode>,
+    nodes_index_map: &'builder mut HashMap<String, NodeIndex>,
     imports: &'builder mut ImportMap,
+    parent_node_key: Option<String>,
     manifest: &'builder Manifest,
+    variables: Vec<Variable>,
     entry_file: PathBuf,
     entrypoint: EntryPoint,
     error: Option<anyhow::Error>,
@@ -147,8 +188,10 @@ impl<'builder> CallGraphBuilder<'builder> {
     pub fn new(
         entry_file: &PathBuf,
         entrypoint: EntryPoint,
+        parent_node_key: Option<String>,
         graph: &'builder mut DiGraph<String, Edge>,
         nodes_map: &'builder mut HashMap<String, CallNode>,
+        nodes_index_map: &'builder mut HashMap<String, NodeIndex>,
         imports: &'builder mut ImportMap,
         manifest: &'builder Manifest,
         depth: usize,
@@ -156,8 +199,11 @@ impl<'builder> CallGraphBuilder<'builder> {
         Self {
             entry_file: entry_file.to_owned(),
             entrypoint,
+            parent_node_key,
             graph,
+            variables: Vec::new(),
             nodes_map,
+            nodes_index_map,
             imports,
             manifest,
             error: None,
@@ -243,6 +289,33 @@ impl<'builder> CallGraphBuilder<'builder> {
 
         Ok(Import::External(ExternalImport::new(&path_prefix[..])))
     }
+
+    fn resolve_node_key(&self) -> String {
+        match &self.entrypoint {
+            EntryPoint::Func(s) => {
+                self.entry_file
+                    .iter()
+                    .map(|i| i.to_string_lossy().to_string())
+                    .collect::<Vec<String>>()
+                    .join("::")
+                    .replace(".rs", "")
+                    + "::"
+                    + s
+            }
+            EntryPoint::MethodCall {
+                target_struct,
+                method,
+            } => {
+                self.entry_file
+                    .iter()
+                    .map(|i| i.to_string_lossy().to_string())
+                    .collect::<Vec<String>>()
+                    .join("::")
+                    .replace(".rs", "")
+                    + format!("::{target_struct}::{method}").as_str()
+            }
+        }
+    }
 }
 
 impl<'ast, 'cgb> Visit<'ast> for CallGraphBuilder<'cgb> {
@@ -258,6 +331,14 @@ impl<'ast, 'cgb> Visit<'ast> for CallGraphBuilder<'cgb> {
         syn::visit::visit_item_use(self, node);
     }
 
+    fn visit_local(&mut self, node: &'ast Local) {
+        println!("[visit_local] {:#?}", node);
+        // Variable {
+        //     id
+        // }
+        syn::visit::visit_local(self, node);
+    }
+
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
         // println!(
         //     "found fn: {} in file {:#?}",
@@ -268,23 +349,32 @@ impl<'ast, 'cgb> Visit<'ast> for CallGraphBuilder<'cgb> {
         if let EntryPoint::Func(s) = &self.entrypoint {
             if s.to_owned() == node.sig.ident.to_string() {
                 self.print(&format!("entered {}", s));
-                let node_key = self
-                    .entry_file
-                    .iter()
-                    .map(|i| i.to_string_lossy().to_string())
-                    .collect::<Vec<String>>()
-                    .join("::")
-                    .replace(".rs", "")
-                    + "::"
-                    + s;
+                let node_key = self.resolve_node_key();
                 let entry_node = CallNode::from(node);
-                self.nodes_map.insert(node_key.clone(), entry_node);
-                self.graph.add_node(node_key);
-                let d = self.depth;
-                let mut builder = FunctionCallBuilder::new(ParentNode::Fn(node), &mut *self, d + 1);
-                if let Err(e) = builder.build() {
-                    self.error = Some(e);
-                    return;
+                if !self.nodes_map.contains_key(&node_key) {
+                    self.nodes_map.insert(node_key.clone(), entry_node);
+                    let node_index = self.graph.add_node(node_key.clone());
+                    self.nodes_index_map.insert(node_key.clone(), node_index);
+
+                    if let Some(parent_node_key) = &self.parent_node_key {
+                        if let Some(parent_node_index) = self.nodes_index_map.get(parent_node_key) {
+                            self.graph.add_edge(*parent_node_index, node_index, Edge {});
+                        }
+                    }
+
+                    let d = self.depth;
+                    let mut builder = FunctionCallBuilder::new(
+                        ParentNode::Fn {
+                            fun: node,
+                            node_key,
+                        },
+                        &mut *self,
+                        d + 1,
+                    );
+                    if let Err(e) = builder.build() {
+                        self.error = Some(e);
+                        return;
+                    }
                 }
             }
         }
@@ -316,21 +406,38 @@ impl<'ast, 'cgb> Visit<'ast> for CallGraphBuilder<'cgb> {
                                         .join("::")
                                         .replace(".rs", "")
                                         + format!("::{target_struct}::{method}").as_str();
-                                    self.nodes_map.insert(node_key.clone(), entry_node);
-                                    self.graph.add_node(node_key);
-                                    let depth = self.depth + 1;
-                                    let mut builder = FunctionCallBuilder::new(
-                                        ParentNode::Method {
-                                            fun: method_node,
-                                            impl_block: node,
-                                        },
-                                        &mut *self,
-                                        depth,
-                                    );
-                                    if let Err(e) = builder.build() {
-                                        self.error = Some(e);
-                                        return;
+                                    if !self.nodes_map.contains_key(&node_key) {
+                                        self.nodes_map.insert(node_key.clone(), entry_node);
+                                        let node_index = self.graph.add_node(node_key.clone());
+                                        self.nodes_index_map
+                                            .insert(node_key.clone(), node_index.clone());
+                                        if let Some(parent_node_key) = &self.parent_node_key {
+                                            if let Some(parent_node_index) =
+                                                self.nodes_index_map.get(parent_node_key)
+                                            {
+                                                self.graph.add_edge(
+                                                    *parent_node_index,
+                                                    node_index,
+                                                    Edge {},
+                                                );
+                                            }
+                                        }
+                                        let depth = self.depth + 1;
+                                        let mut builder = FunctionCallBuilder::new(
+                                            ParentNode::Method {
+                                                fun: method_node,
+                                                impl_block: node,
+                                                node_key,
+                                            },
+                                            &mut *self,
+                                            depth,
+                                        );
+                                        if let Err(e) = builder.build() {
+                                            self.error = Some(e);
+                                            return;
+                                        }
                                     }
+
                                     break;
                                 }
                             }
@@ -345,10 +452,14 @@ impl<'ast, 'cgb> Visit<'ast> for CallGraphBuilder<'cgb> {
 }
 
 enum ParentNode<'a> {
-    Fn(&'a ItemFn),
+    Fn {
+        fun: &'a ItemFn,
+        node_key: String,
+    },
     Method {
         fun: &'a ImplItemFn,
         impl_block: &'a ItemImpl,
+        node_key: String,
     },
 }
 
@@ -356,7 +467,7 @@ impl<'a> ParentNode<'a> {
     #[allow(unused)]
     fn ident(&self) -> String {
         match self {
-            Self::Fn(x) => x.sig.ident.to_string(),
+            Self::Fn { fun, .. } => fun.sig.ident.to_string(),
             Self::Method { fun, .. } => fun.sig.ident.to_string(),
         }
     }
@@ -384,7 +495,7 @@ impl<'fcb, 'cgb, 'pn> FunctionCallBuilder<'fcb, 'cgb, 'pn> {
 
     pub fn build<'ast>(&mut self) -> anyhow::Result<()> {
         match self.parent_node {
-            ParentNode::Fn(f) => self.visit_block(&f.block),
+            ParentNode::Fn { fun, .. } => self.visit_block(&fun.block),
             ParentNode::Method { fun, .. } => self.visit_block(&fun.block),
         };
 
@@ -393,10 +504,85 @@ impl<'fcb, 'cgb, 'pn> FunctionCallBuilder<'fcb, 'cgb, 'pn> {
         }
         Ok(())
     }
+
+    fn handle_fn_call<FItem>(&mut self, ident: String, fn_item: FItem)
+    where
+        CallNode: From<FItem>,
+    {
+        println!("[handle_fn_call] ident: {} ", ident,);
+        let parent_node_key = match &self.parent_node {
+            ParentNode::Fn { node_key, .. } => node_key.clone(),
+            ParentNode::Method { node_key, .. } => node_key.clone(),
+        };
+
+        if let Some(import) = self.call_graph_builder.imports.get(&ident) {
+            self.print(&format!("found fn call: {}", ident));
+            let mut import_map = ImportMap::new();
+            let depth = self.depth + 1;
+
+            match import {
+                Import::Local(import) => {
+                    let mut builder = CallGraphBuilder::new(
+                        &import.module_file_path,
+                        EntryPoint::Func(ident.to_string()),
+                        Some(parent_node_key),
+                        &mut self.call_graph_builder.graph,
+                        &mut self.call_graph_builder.nodes_map,
+                        &mut self.call_graph_builder.nodes_index_map,
+                        &mut import_map,
+                        &self.call_graph_builder.manifest,
+                        depth,
+                    );
+
+                    if let Err(e) = builder.build() {
+                        self.error = Some(e);
+                        return;
+                    }
+                }
+                Import::External(import) => {
+                    let call_node = CallNode::from(fn_item);
+
+                    if !self
+                        .call_graph_builder
+                        .nodes_map
+                        .contains_key(&import.full_path)
+                    {
+                        self.call_graph_builder
+                            .nodes_map
+                            .insert(import.full_path.clone(), call_node);
+                        let node_index = self
+                            .call_graph_builder
+                            .graph
+                            .add_node(import.full_path.clone());
+                        self.call_graph_builder
+                            .nodes_index_map
+                            .insert(import.full_path.clone(), node_index.clone());
+
+                        if let Some(parent_node_index) = self
+                            .call_graph_builder
+                            .nodes_index_map
+                            .get(&parent_node_key)
+                        {
+                            self.call_graph_builder.graph.add_edge(
+                                *parent_node_index,
+                                node_index,
+                                Edge {},
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl<'ast, 'fcb, 'cgb, 'pn> Visit<'ast> for FunctionCallBuilder<'fcb, 'cgb, 'pn> {
     fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        let parent_node_key = match &self.parent_node {
+            ParentNode::Fn { node_key, .. } => node_key.clone(),
+            ParentNode::Method { node_key, .. } => node_key.clone(),
+        };
+
         if let Expr::Path(expr_path) = &*node.func {
             // println!(
             //     "[visit_expr_call] in function {} in file {:#?} ",
@@ -410,27 +596,8 @@ impl<'ast, 'fcb, 'cgb, 'pn> Visit<'ast> for FunctionCallBuilder<'fcb, 'cgb, 'pn>
                 //     self.parent_node.ident(),
                 //     self.call_graph_builder.entry_file
                 // );
-                if let Some(import) = self.call_graph_builder.imports.get(&ident.to_string()) {
-                    if let Import::Local(import) = import {
-                        self.print(&format!("found fn call: {}", ident.to_string()));
-                        let mut import_map = ImportMap::new();
-                        let depth = self.depth + 1;
-                        let mut builder = CallGraphBuilder::new(
-                            &import.module_file_path,
-                            EntryPoint::Func(ident.to_string()),
-                            &mut self.call_graph_builder.graph,
-                            &mut self.call_graph_builder.nodes_map,
-                            &mut import_map,
-                            &self.call_graph_builder.manifest,
-                            depth,
-                        );
-
-                        if let Err(e) = builder.build() {
-                            self.error = Some(e);
-                            return;
-                        }
-                    }
-                }
+                // println!("{:#?}", ident);
+                self.handle_fn_call(ident.to_string(), expr_path);
             } else if expr_path.path.segments.len() == 2 {
                 let first = expr_path.path.segments.first().unwrap();
                 let import_identifier = first.ident.to_string();
@@ -462,24 +629,45 @@ impl<'ast, 'fcb, 'cgb, 'pn> Visit<'ast> for FunctionCallBuilder<'fcb, 'cgb, 'pn>
                                         .replace(".rs", "")
                                         + "::"
                                         + &s;
-                                    self.call_graph_builder
-                                        .nodes_map
-                                        .insert(node_key.clone(), entry_node);
-                                    self.call_graph_builder.graph.add_node(node_key);
+                                    if !self.call_graph_builder.nodes_map.contains_key(&node_key) {
+                                        self.call_graph_builder
+                                            .nodes_map
+                                            .insert(node_key.clone(), entry_node);
+                                        let node_index = self
+                                            .call_graph_builder
+                                            .graph
+                                            .add_node(node_key.clone());
+                                        self.call_graph_builder
+                                            .nodes_index_map
+                                            .insert(node_key.clone(), node_index.clone());
 
-                                    let depth = self.depth + 1;
-                                    let mut builder = FunctionCallBuilder::new(
-                                        ParentNode::Method {
-                                            fun: method_node,
-                                            impl_block,
-                                        },
-                                        &mut *self.call_graph_builder,
-                                        depth,
-                                    );
+                                        if let Some(parent_node_index) = self
+                                            .call_graph_builder
+                                            .nodes_index_map
+                                            .get(&parent_node_key)
+                                        {
+                                            self.call_graph_builder.graph.add_edge(
+                                                *parent_node_index,
+                                                node_index,
+                                                Edge {},
+                                            );
+                                        }
 
-                                    if let Err(e) = builder.build() {
-                                        self.error = Some(e);
-                                        return;
+                                        let depth = self.depth + 1;
+                                        let mut builder = FunctionCallBuilder::new(
+                                            ParentNode::Method {
+                                                fun: method_node,
+                                                impl_block,
+                                                node_key,
+                                            },
+                                            &mut *self.call_graph_builder,
+                                            depth,
+                                        );
+
+                                        if let Err(e) = builder.build() {
+                                            self.error = Some(e);
+                                            return;
+                                        }
                                     }
 
                                     break;
@@ -490,7 +678,7 @@ impl<'ast, 'fcb, 'cgb, 'pn> Visit<'ast> for FunctionCallBuilder<'fcb, 'cgb, 'pn>
                 } else if let Some(import) = self.call_graph_builder.imports.get(&import_identifier)
                 {
                     if let Import::Local(import) = import {
-                        self.print(&format!("found: {}", import_identifier.to_string()));
+                        self.print(&format!("found=====: {}", import_identifier.to_string()));
                         let last = expr_path.path.segments.last().unwrap();
                         let method = last.ident.to_string();
                         let mut import_map = ImportMap::new();
@@ -501,8 +689,10 @@ impl<'ast, 'fcb, 'cgb, 'pn> Visit<'ast> for FunctionCallBuilder<'fcb, 'cgb, 'pn>
                                 target_struct: import_identifier,
                                 method,
                             },
+                            Some(parent_node_key),
                             &mut self.call_graph_builder.graph,
                             &mut self.call_graph_builder.nodes_map,
+                            &mut self.call_graph_builder.nodes_index_map,
                             &mut import_map,
                             &self.call_graph_builder.manifest,
                             depth,
@@ -520,12 +710,10 @@ impl<'ast, 'fcb, 'cgb, 'pn> Visit<'ast> for FunctionCallBuilder<'fcb, 'cgb, 'pn>
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
-        // println!(
-        //     "[visit_expr_method_call] in function {} in file {:#?} {:#?} ",
-        //     self.parent_node.sig.ident.to_string(),
-        //     self.call_graph_builder.entry_file,
-        //     node
-        // );
+        // println!("[visit_expr_method_call] in function in file  {:#?} ", node);
+
+        // self.handle_fn_call(node.method.to_string(), node);
+
         syn::visit::visit_expr_method_call(self, node);
     }
 }

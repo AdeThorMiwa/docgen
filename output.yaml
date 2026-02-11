@@ -1,0 +1,45 @@
+openapi: 3.0.3
+info:
+  title: Generated API
+  description: A description of the generated API
+  version: 1.0.0
+paths:
+  /authenticate:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              properties:
+                Full:
+                  type: object
+                Partial:
+                  type: object
+              type: object
+        required: true
+      responses:
+        '200':
+          description: Successful operation
+  /channels:
+    get:
+      responses:
+        '200':
+          description: Successful operation
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              properties:
+                name:
+                  type: string
+              type: object
+        required: true
+      responses:
+        '200':
+          description: Successful operation
+  /health:
+    get:
+      responses:
+        '200':
+          description: Successful operation
